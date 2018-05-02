@@ -61,6 +61,32 @@ class Analyze(object):
             'volume': 'max',
         })
         return frame
+    @staticmethod
+    def ML_parse_ticker_dataframe(pair: str, ticker: list) -> DataFrame:
+        """
+        Analyses the trend for the given ticker history
+        :param ticker: See exchange.get_ticker_history
+        :return: DataFrame
+        """
+        columns = {'C': pair+'_close', 'V': pair+'_volume', 'O': pair+'_open', 'H': pair+'_high', 'L': pair+'_low', 'T': pair+'_date'}
+        frame = DataFrame(ticker).rename(columns=columns).set_index(pair+'_date')
+        frame.index.names = [None]
+        
+        if 'BV' in frame:
+            frame.drop('BV', axis=1, inplace=True)
+
+        frame.index = to_datetime(frame.index, utc=True, infer_datetime_format=True)
+        
+        # # group by index and aggregate results to eliminate duplicate ticks
+        # frame = frame.groupby(by=pair+'_date', as_index=False, sort=True).agg({
+        #     pair+'_close': 'last',
+        #     pair+'_high': 'max',
+        #     pair+'_low': 'min',
+        #     pair+'_open': 'first',
+        #     pair+'_volume': 'max',
+        # })
+        
+        return frame
 
     def populate_indicators(self, dataframe: DataFrame) -> DataFrame:
         """
@@ -139,9 +165,9 @@ class Analyze(object):
         if dataframe.empty:
             logger.warning('Empty dataframe for pair %s', pair)
             return False, False
-
+  
         latest = dataframe.iloc[-1]
-
+        
         # Check if dataframe is out of date
         signal_date = arrow.get(latest['date'])
         if signal_date < arrow.utcnow() - timedelta(minutes=(interval + 5)):
@@ -212,4 +238,11 @@ class Analyze(object):
         Creates a dataframe and populates indicators for given ticker data
         """
         return {pair: self.populate_indicators(self.parse_ticker_dataframe(pair_data))
+                for pair, pair_data in tickerdata.items()}
+    
+    def ML_tickerdata_to_dataframe(self, tickerdata: Dict[str, List]) -> Dict[str, DataFrame]:
+        """
+        Creates a dataframe and populates indicators for given ticker data
+        """
+        return {pair: self.ML_parse_ticker_dataframe(pair, pair_data)
                 for pair, pair_data in tickerdata.items()}

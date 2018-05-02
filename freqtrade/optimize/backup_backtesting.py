@@ -20,10 +20,6 @@ from freqtrade.configuration import Configuration
 from freqtrade.exchange import Bittrex
 from freqtrade.misc import file_dump_json
 from freqtrade.persistence import Trade
-from pandas import DataFrame, to_datetime
-import pandas as pd
-from freqtrade.optimize import ml_utils
-import matplotlib.pyplot as plt
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +37,7 @@ class Backtesting(object):
         self.config = config
         self.analyze = None
         self.ticker_interval = None
-        self.ML_tickerdata_to_dataframe = None
+        self.tickerdata_to_dataframe = None
         self.populate_buy_trend = None
         self.populate_sell_trend = None
         self.slippage = None
@@ -55,7 +51,7 @@ class Backtesting(object):
         self.analyze = Analyze(self.config)
         self.ticker_interval = self.analyze.strategy.ticker_interval
         self.slippage = self.analyze.strategy.slippage
-        self.ML_tickerdata_to_dataframe = self.analyze.ML_tickerdata_to_dataframe
+        self.tickerdata_to_dataframe = self.analyze.tickerdata_to_dataframe
         self.populate_buy_trend = self.analyze.populate_buy_trend
         self.populate_sell_trend = self.analyze.populate_sell_trend
         exchange._API = Bittrex({'key': '', 'secret': ''})
@@ -214,59 +210,6 @@ class Backtesting(object):
         labels = ['currency', 'profit_percent', 'profit_BTC', 'duration']
         return DataFrame.from_records(trades, columns=labels)
 
-    def run_buy_sell_strategy(self, data, initial_cash, transaction_cost, alpha):
-        """Runs a simple strategy.
-
-            Buys alpha*portfolio value when predicted up and sells alpha*portfolio
-            value when predicted down.
-
-            Assume that data has the following format
-            [BTC-USD_Low
-            BTC-USD_High
-            BTC-USD_Open
-            BTC-USD_Close
-            BTC-USD_Volume
-            BTC-USD_Prediction]
-
-            The trading startegy takes 'Prediction' column to make buy/sell decision.
-        """
-        trading_portfolio = pd.DataFrame(index = data.index)
-        trading_portfolio['Portfolio_value'] = pd.Series(index = data.index)
-        trading_portfolio['Coins_held'] = pd.Series(index = data.index)
-        trading_portfolio['Cash_held'] = pd.Series(index = data.index)
-
-        coins_held = 0
-        cash_held = initial_cash
-        portfolio_value = coins_held + cash_held
-        for i, row in enumerate(data.values):
-            date = data.index[i]
-            low, high, open, close, volume, prediction = row
-            if prediction == 1:
-                # Buy coin.
-                transaction = min(alpha * portfolio_value, cash_held)
-                fee = transaction * transaction_cost
-                coins_held += transaction / close
-                cash_held -= transaction - fee
-            if prediction == 0:
-                # Sell coin.
-                transaction = min(alpha*portfolio_value,coins_held * close)
-                fee = transaction * transaction_cost
-                coins_held -= transaction / close
-                cash_held += transaction - fee
-            portfolio_value = coins_held*close + cash_held
-            trading_portfolio['Portfolio_value'][date] = portfolio_value
-            trading_portfolio['Coins_held'][date] = coins_held
-            trading_portfolio['Cash_held'][date] = cash_held
-        profit = portfolio_value - initial_cash
-        ret = 100 * profit / initial_cash
-        avg_value = trading_portfolio['Portfolio_value'].mean()
-        std_value = trading_portfolio['Portfolio_value'].std()
-        trading_stats = { 'profit_dollar': profit,
-        'return_percent': ret,
-        'avg_value': avg_value,
-        'std value': std_value }
-        return(trading_portfolio, trading_stats)
-
     def start(self) -> None:
         """
         Run a backtesting end-to-end
@@ -277,34 +220,65 @@ class Backtesting(object):
         logger.info('Using stake_currency: %s ...', self.config['stake_currency'])
         logger.info('Using stake_amount: %s ...', self.config['stake_amount'])
 
-        timerange = Arguments.parse_timerange(self.config.get('timerange'))
+        if self.config.get('live'):
+            logger.info('Downloading data for all pairs in whitelist ...')
+            for pair in pairs:
+                data[pair] = exchange.get_ticker_history(pair, self.ticker_interval)
+        else:
+            logger.info('Using local backtesting data (using whitelist in given config) ...')
 
-        data = optimize.load_data(
-            self.config['datadir'],
-            pairs=pairs,
-            ticker_interval=self.ticker_interval,
-            refresh_pairs=False,
-            timerange=timerange
+            timerange = Arguments.parse_timerange(self.config.get('timerange'))
+            data = optimize.load_data(
+                self.config['datadir'],
+                pairs=pairs,
+                ticker_interval=self.ticker_interval,
+                refresh_pairs=self.config.get('refresh_pairs', False),
+                timerange=timerange
+            )
+
+        # Ignore max_open_trades in backtesting, except realistic flag was passed
+        if self.config.get('realistic_simulation', False):
+            max_open_trades = self.config['max_open_trades']
+        else:
+            logger.info('Ignoring max_open_trades (realistic_simulation not set) ...')
+            max_open_trades = 0
+
+        preprocessed = self.tickerdata_to_dataframe(data)
+        print(preprocessed)
+        # Print timeframe
+        min_date, max_date = self.get_timeframe(preprocessed)
+        logger.info(
+            'Measuring data from %s up to %s (%s days)..',
+            min_date.isoformat(),
+            max_date.isoformat(),
+            (max_date - min_date).days
         )
 
-        preprocessed = self.ML_tickerdata_to_dataframe(data)
+        # Execute backtest and print results
+        sell_profit_only = self.config.get('experimental', {}).get('sell_profit_only', False)
+        use_sell_signal = self.config.get('experimental', {}).get('use_sell_signal', False)
+        results = self.backtest(
+            {
+                'stake_amount': self.config.get('stake_amount'),
+                'processed': preprocessed,
+                'max_open_trades': max_open_trades,
+                'realistic': self.config.get('realistic_simulation', False),
+                'sell_profit_only': sell_profit_only,
+                'use_sell_signal': use_sell_signal,
+                'record': self.config.get('export')
+            }
+        )
+        logger.info(
+            '\n==================================== '
+            'BACKTESTING REPORT'
+            ' ====================================\n'
+            '%s',
+            self._generate_text_table(
+                data,
+                results
+            )
+        )
 
-        out_coin = 'BTC_XMR'
-        test_ratio = 0.2
-
-        data = ml_utils.run_pipeline(preprocessed[out_coin], out_coin, test_ratio)
-       
-        initial_cash = 100 # in USD
-        transaction_cost = 0.01 # as ratio for fee
-        alpha = 0.05 # ratio of portfolio value that we trade each transaction
-        (trading_portfolio, trading_stats) = self.run_buy_sell_strategy(data, initial_cash, transaction_cost, alpha)
-        print(trading_portfolio)
-        #print(trading_portfolio.head(),"Head of trading series.")
-        print ("Stats from trading: ", trading_stats)
-        # plots trading portfolio value in time next to out_coin price
-        trading_portfolio.plot(subplots=True, figsize=(6, 6)); plt.legend(loc='best')
-        plt.show()
-        
 
 def setup_configuration(args: Namespace) -> Dict[str, Any]:
     """
